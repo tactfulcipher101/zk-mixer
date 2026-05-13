@@ -1,16 +1,23 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Poseidon2} from "@poseidon/src/poseidon2.sol';
+
 contract IncrementalMerkleTree {
     uint32 public immutable i_depth;
+
+    Poseidon2 public immutable i_hasher;
     bytes32 public s_root;
+
+    uint32 public s_nextLeafIndex = 0; //the index of the next leaf to be inserted in the merkle tree, starts at 0 and increments by 1 for each new leaf
+    mapping(uint32 => bytes32) public s_cachedSubtrees;
 
     error IncrementalMerkleTree_DepthShouldBeGreaterThanZero();
     error IncrementalMerkleTree_DepthShouldBeLessThan32();
     error IncrementalMerkleTree__IndexOutOfBounds(uint256 index);
 
 
-    constructor(uint32 _depth) {
+    constructor(uint32 _depth, Poseidon2 _hasher) {
         if (_depth == 0) {
             revert IncrementalMerkleTree_DepthShouldBeGreaterThanZero();
         }
@@ -20,11 +27,60 @@ contract IncrementalMerkleTree {
         }
 
         i_depth = _depth;
-
+        i_hasher = _hasher;
         // initialize the tree with zeros(precompute all the zero subtrees)
         //store the initial root in storage
         s_root =zeros(_depth); //store the ID 0 as the depth 0, zero tree
     }
+
+
+
+        function _insert(bytes32 _leaf) internal returns (uint32) {
+        // add the leaf to the incremental merkle tree
+        uint32 _nextLeafIndex = s_nextLeafIndex;
+        
+        // check that the index of the leaf is within the maximum index
+        if (_nextLeafIndex >= uint32(2**i_depth)) {
+            revert IncrementalMerkleTree__MerkleTreeFull(_nextLeafIndex);
+        }
+        
+            
+            
+        //do this all the way up the tree until we reach the root and update the root in storage
+
+        uint32 currentIndex = _nextLeafIndex;
+        bytes32 currentHash = _leaf;
+        bytes32 left;
+        bytes32 right;
+
+        for (uint32 i = 0; i < i_depth; i++) {
+            if (_nextLeafIndex % 2 == 0) {
+                //if even, we need to put the leaf on the left and a zero tree on the right 
+                left = currentHash;
+                right = zeros(i); //get the zero tree for the current level from the precomputed zeros function
+                s_cachedSubtrees[i] = currentHash;
+            // store the result as a cached subtree
+            } else {
+                //if odd, we need to put the leaf on the right and a cached subtree on the left (the cached subtree is the result of hashing the previous leaf with the zero value for that level)
+                left = s_cachedSubtrees[i];
+                right = currentHash;
+            }
+           //do the hash
+            bytes32 currentHash = Field.toBytes32(i_hasher.hash_2(Field.toField(left), Field.toField(right)));
+            
+           //update the current index
+           currentIndex = currentIndex / 2;
+        }
+        //store the root in storage
+        s_root = currentHash;
+        //increment the next leaf index
+        s_nextLeafIndex = _nextLeafIndex + 1;
+
+        return _nextLeafIndex;
+    } 
+
+
+
 
         function zeros(uint256 i) public pure returns (bytes32) {
         if (i == 0) return bytes32(0x0d823319708ab99ec915efd4f7e03d11ca1790918e8f04cd14100aceca2aa9ff);
@@ -63,10 +119,7 @@ contract IncrementalMerkleTree {
     }
 
 
-    function _insert(bytes32 _leaf) internal {
-
-
-    } 
+   
 
 
 
