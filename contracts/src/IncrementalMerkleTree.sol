@@ -1,88 +1,38 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Poseidon2} from "@poseidon/src/poseidon2.sol';
+import { Poseidon2, Field } from "@poseidon/Poseidon2.sol";
 
 contract IncrementalMerkleTree {
     uint32 public immutable i_depth;
-
     Poseidon2 public immutable i_hasher;
-    bytes32 public s_root;
+    uint32 public s_nextLeafIndex;
 
-    uint32 public s_nextLeafIndex = 0; //the index of the next leaf to be inserted in the merkle tree, starts at 0 and increments by 1 for each new leaf
+    mapping(uint256 => bytes32) public s_roots;
     mapping(uint32 => bytes32) public s_cachedSubtrees;
 
-    error IncrementalMerkleTree_DepthShouldBeGreaterThanZero();
-    error IncrementalMerkleTree_DepthShouldBeLessThan32();
-    error IncrementalMerkleTree__IndexOutOfBounds(uint256 index);
+    uint32 public constant ROOT_HISTORY_SIZE = 30;
+    uint32 public s_currentRootIndex;
 
+    error IncrementalMerkleTree__ZeroDepth();
+    error IncrementalMerkleTree__HighDepth();
+    error IncrementalMerkleTree__IndexOutOfBounds(uint32 index);
+    error IncrementalMerkleTree__MerkleTreeExhausted();
 
-    constructor(uint32 _depth, Poseidon2 _hasher) {
-        if (_depth == 0) {
-            revert IncrementalMerkleTree_DepthShouldBeGreaterThanZero();
+    constructor(uint32 _depth, Poseidon2 _hasher){
+        if(_depth == 0){
+            revert IncrementalMerkleTree__ZeroDepth();
         }
-
-        if (_depth >= 32){
-            revert IncrementalMerkleTree_DepthShouldBeLessThan32();
+        if(_depth >= 32){
+            revert IncrementalMerkleTree__HighDepth();
         }
-
         i_depth = _depth;
         i_hasher = _hasher;
-        // initialize the tree with zeros(precompute all the zero subtrees)
-        //store the initial root in storage
-        s_root =zeros(_depth); //store the ID 0 as the depth 0, zero tree
+
+        s_roots[0] = zeros(_depth-1);
     }
 
-
-
-        function _insert(bytes32 _leaf) internal returns (uint32) {
-        // add the leaf to the incremental merkle tree
-        uint32 _nextLeafIndex = s_nextLeafIndex;
-        
-        // check that the index of the leaf is within the maximum index
-        if (_nextLeafIndex >= uint32(2**i_depth)) {
-            revert IncrementalMerkleTree__MerkleTreeFull(_nextLeafIndex);
-        }
-        
-            
-            
-        //do this all the way up the tree until we reach the root and update the root in storage
-
-        uint32 currentIndex = _nextLeafIndex;
-        bytes32 currentHash = _leaf;
-        bytes32 left;
-        bytes32 right;
-
-        for (uint32 i = 0; i < i_depth; i++) {
-            if (_nextLeafIndex % 2 == 0) {
-                //if even, we need to put the leaf on the left and a zero tree on the right 
-                left = currentHash;
-                right = zeros(i); //get the zero tree for the current level from the precomputed zeros function
-                s_cachedSubtrees[i] = currentHash;
-            // store the result as a cached subtree
-            } else {
-                //if odd, we need to put the leaf on the right and a cached subtree on the left (the cached subtree is the result of hashing the previous leaf with the zero value for that level)
-                left = s_cachedSubtrees[i];
-                right = currentHash;
-            }
-           //do the hash
-            bytes32 currentHash = Field.toBytes32(i_hasher.hash_2(Field.toField(left), Field.toField(right)));
-            
-           //update the current index
-           currentIndex = currentIndex / 2;
-        }
-        //store the root in storage
-        s_root = currentHash;
-        //increment the next leaf index
-        s_nextLeafIndex = _nextLeafIndex + 1;
-
-        return _nextLeafIndex;
-    } 
-
-
-
-
-        function zeros(uint256 i) public pure returns (bytes32) {
+    function zeros(uint32 i) public pure returns(bytes32){
         if (i == 0) return bytes32(0x0d823319708ab99ec915efd4f7e03d11ca1790918e8f04cd14100aceca2aa9ff);
         else if (i == 1) return bytes32(0x170a9598425eb05eb8dc06986c6afc717811e874326a79576c02d338bdf14f13);
         else if (i == 2) return bytes32(0x273b1a40397b618dac2fc66ceb71399a3e1a60341e546e053cbfa5995e824caf);
@@ -118,9 +68,57 @@ contract IncrementalMerkleTree {
         else revert IncrementalMerkleTree__IndexOutOfBounds(i);
     }
 
+    function _insert(bytes32 leaf) internal returns(uint32){
+        uint32 _nextLeafIndex = s_nextLeafIndex;
+        uint32 currentIndex = _nextLeafIndex;
+        bytes32 currentHash = leaf;
+        bytes32 left;
+        bytes32 right;
 
-   
+        if(_nextLeafIndex == uint32(2) ** i_depth){
+            revert IncrementalMerkleTree__MerkleTreeExhausted();
+        }
 
+        for(uint32 i = 0; i < i_depth; i++){
+            if(currentIndex % 2 == 0){
+                left = currentHash;
+                right = zeros(i);
 
+                s_cachedSubtrees[i] = currentHash;
+            } else {
+                left = s_cachedSubtrees[i];
+                right = currentHash;
+            }
 
+            currentHash = Field.toBytes32(i_hasher.hash_2(Field.toField(left), Field.toField(right)));
+            currentIndex = currentIndex/2;
+        }
+        uint32 newRootIndex = (s_currentRootIndex + 1) % ROOT_HISTORY_SIZE;
+        s_currentRootIndex = newRootIndex;
+        s_roots[newRootIndex] = currentHash;
+        s_nextLeafIndex = _nextLeafIndex + 1;
+
+        return _nextLeafIndex;
+    }
+
+    function isKnownRoot(bytes32 _root) public view returns(bool){
+        if(_root == bytes32(0)){
+            return false;
+        }
+
+        uint32 _currentRootIndex = s_currentRootIndex;
+        uint32 i =_currentRootIndex;
+
+        do {
+            if(s_roots[i] == _root){
+                return true;
+            }
+            if(i == 0){
+                i = ROOT_HISTORY_SIZE;
+            }
+            i--;
+        } while (i != _currentRootIndex);
+
+        return false;
+    }
 }

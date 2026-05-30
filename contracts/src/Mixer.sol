@@ -1,68 +1,69 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
-import {IVerifier} from "./Verifier.sol";
-import {IncrementalMerkleTree, Poseidon2} from "./IncrementalMerkleTree.sol";
 
+import { IVerifier } from "./Verifier.sol";
+import { IncrementalMerkleTree, Poseidon2 } from "./IncrementalMerkleTree.sol";
+import { ReentrancyGuard } from "solmate/utils/ReentrancyGuard.sol";
 
+contract Mixer is IncrementalMerkleTree, ReentrancyGuard{
 
-contract Mixer is IncrementalMerkleTree {
-    //mapping to store whether a commitment has been used before to prevent double deposits
+    IVerifier public immutable i_verifier;
+
     mapping(bytes32 => bool) public s_commitments;
-    mapping(bytes32 => bool) public s_nullifierHashes; //mapping to store whether a nullifier hash has been used before to prevent double spending
+    mapping(bytes32 => bool) public s_nullifierHashes;
 
-    //the amount of ETH that can be deposited and withdrawn from the mixer 
-    uint256 public constant DENOMINATION = 0.01 ether; 
+    uint256 public constant DENOMINATION = 0.001 ether;
 
-    error Mixer_CommitmentAlreadyAdded(bytes32 commitment);
-    error Mixer_DepositAmountNotCorrect(uint256 value, uint256 expected);
-    error Mixer_UnknownRoot(bytes32 root);
-    error Mixer_NullifierAlreadyUsed(bytes32 nullifierHash);
+    event Deposit(bytes32 indexed commitment, uint32 indexInserted, uint256 time);
+    event Withdrawal(address indexed recipient, bytes32 nullifierHash);
 
+    error Mixer__InvalidAmount(uint256 amountSent, uint256 amountExpected);
+    error Mixer__CommitmentAlreadyAdded(bytes32 commitment);
+    error Mixer__RootMismatch(bytes32 givenRoot);
+    error Mixer__NullifierAlreadyUsed(bytes32 usedNullifier);
+    error Mixer__InvalidProof();      
+    error Mixer__TransferFailed(address recipient, uint256 amount);
 
-    IVerifier public immutable  i_verifier;
-    constructor(IVerifier _verifier, Poseidon2 _hasher, uint32 _merkleTreeDepth) IncrementalMerkleTree(_merkleTreeDepth, _hasher) {
+    constructor(IVerifier _verifier, uint32 _merkleTreeDepth, Poseidon2 _hasher) IncrementalMerkleTree(_merkleTreeDepth, _hasher){ 
         i_verifier = _verifier;
     }
-    //@notice Deposit Funds into the mixer
-    //@param _commitment the poseidon commitment of the nullifier and secret(generated off-chain)
-    function deposit(bytes32 _commitment) external payable {
-       //check whether the commitment has been used before to prevent a deposit being added twice to the merkle tree
-       if (s_commitments[_commitment]) {
-           revert Mixer_CommitmentAlreadyAdded(_commitment);
-       }
 
-       //check that the user has sent the correct amount of ETH (e.g. 0.1, 1, 10 ETH)
-       if (msg.value != DENOMINATION) {
-           revert Mixer_DepositAmountNotCorrect(msg.value, DENOMINATION);
-       }
-       
-       //add the commitment to to the on-chain incremental merkle tree containing all the commitments and add the commitment to the merkle tree
-       //allow the user to seend ETH and make sure it is of the correct denomination (e.g. 0.1, 1, 10 ETH)
+    function deposit(bytes32 _commitment) payable external nonReentrant{
+        if(msg.value != 0.001 ether){
+            revert Mixer__InvalidAmount(msg.value, DENOMINATION);
+        }
+        if(s_commitments[_commitment]){
+            revert Mixer__CommitmentAlreadyAdded(_commitment);
+        }
         uint32 insertedIndex = _insert(_commitment);
-        s_commitments[_commitment] = true; //mark the commitment as used
+        s_commitments[_commitment] = true;
 
         emit Deposit(_commitment, insertedIndex, block.timestamp);
+    }
 
-    } 
-
-
-    //@notice Withdraw Funds from the mixer in a private way
-    function withdraw(bytes _proof, bytes32 _root, bytes32 _nullifierHash) external {
-    // check that the root that was used in the proof matches the root on-chain to prevent a user from using an old root that is no longer valid
-     if (_root != s_root) {
-         revert Mixer_UnknownRoot(_root);
-     }
-    
-    // check that the nullifier has not yet been used to prevent double spending
-
-     if (s_nullifierHashes[_nullifierHash]) {
-         revert Mixer_NullifierAlreadyUsed(_nullifierHash);
-     }
-
-    //check that the proof is valid by calling the verifier contract
-    s_nullifierHashes[_nullifierHash] = true; //mark the nullifier as used to prevent double spending
-
-    //verify the proof using the verifier contract and make sure the nullifier has not been used before to prevent double spending
-    //if the proof is valid and the nullifier has not been used before, transfer the funds
+    function withdraw(bytes calldata _proof, bytes32 _root, bytes32 _nullifierHash, address _recipient) external nonReentrant{
+        if(!isKnownRoot(_root)){
+            revert Mixer__RootMismatch(_root);
         }
+        if(s_nullifierHashes[_nullifierHash]){
+            revert Mixer__NullifierAlreadyUsed(_nullifierHash);
+        }
+
+        bytes32[] memory publicInputs = new bytes32[](3);
+        publicInputs[0] = _root;
+        publicInputs[1] = _nullifierHash;
+        publicInputs[2] = bytes32(uint256(uint160(_recipient)));
+        if(!i_verifier.verify(_proof, publicInputs)){
+            revert Mixer__InvalidProof();
+        }
+
+        s_nullifierHashes[_nullifierHash] = true;
+
+        (bool success, ) = payable(_recipient).call{value: DENOMINATION}("");
+        if(!success){
+            revert Mixer__TransferFailed(_recipient, DENOMINATION);
+        }
+        
+        emit Withdrawal(_recipient, _nullifierHash);
+    }
 }
